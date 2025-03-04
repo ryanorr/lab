@@ -1,0 +1,175 @@
+- hosts: all
+  become: yes
+  vars:
+    k8s_version: "v1.32"
+
+  tasks:
+    ###########################################################################
+    # 1. Basic system configuration for Kubernetes
+    ###########################################################################
+
+    - name: Enable IPv4 packet forwarding
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: "1"
+        state: present
+        reload: yes
+
+    - name: Open port 6443 and 10250 for Kubernetes
+      firewalld:
+        port: "{{ item }}"
+        permanent: true
+        state: enabled
+        immediate: yes
+      with_items:
+        - "6443/tcp"
+        - "10250/tcp"
+
+    - name: Disable swap (remove from /etc/fstab and turn it off)
+      shell: |
+        sed -i '/swap/d' /etc/fstab
+        swapoff -a
+      args:
+        creates: /root/.swapoff-ansible
+      register: disable_swap
+      changed_when: disable_swap.rc == 0
+
+    ###########################################################################
+    # 2. Install containerd & Kubernetes packages
+    ###########################################################################
+
+    - name: Ensure container-selinux is installed
+      yum:
+        name: container-selinux
+        state: present
+
+    - name: Ensure required packages are installed
+      yum:
+        name:
+          - yum-utils
+          - device-mapper-persistent-data
+          - lvm2
+        state: present
+
+    - name: Add Docker CE repository
+      yum_repository:
+        name: docker-ce
+        description: Docker CE Stable
+        baseurl: https://download.docker.com/linux/centos/$releasever/$basearch/stable
+        gpgcheck: yes
+        gpgkey: https://download.docker.com/linux/centos/gpg
+        enabled: yes
+      when: ansible_distribution_major_version == "9"  # Adjust if needed for Rocky 9
+
+    - name: Install containerd
+      yum:
+        name:
+          - containerd.io
+        state: latest
+
+    - name: Configure containerd (systemd cgroup driver)
+      shell: |
+        containerd config default > /etc/containerd/config.toml
+        sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+
+    - name: Start and enable containerd on boot
+      systemd:
+        name: containerd
+        state: started
+        enabled: yes
+
+    - name: Add Kubernetes repository
+      yum_repository:
+        name: "kubernetes"
+        description: "Kubernetes ({{ k8s_version }})"
+        baseurl: "https://pkgs.k8s.io/core:/stable:/{{ k8s_version }}/rpm/"
+        enabled: yes
+        gpgcheck: yes
+        repo_gpgcheck: yes
+        gpgkey: "https://pkgs.k8s.io/core:/stable:/{{ k8s_version }}/rpm/repodata/repomd.xml.key"
+
+    - name: Install Kubernetes packages
+      yum:
+        name:
+          - kubeadm
+          - kubelet
+          - kubectl
+        state: latest
+
+    - name: Enable kubelet service
+      systemd:
+        name: kubelet
+        enabled: yes
+
+- hosts: k8s_masters
+  become: yes
+  tasks:
+    ###########################################################################
+    # 3. kubeadm init and generate join token
+    ###########################################################################
+
+    - name: Initialize Kubernetes control plane (using containerd CRI socket)
+      shell: |
+        kubeadm init --pod-network-cidr=10.244.0.0/16 \
+                     --cri-socket unix:///run/containerd/containerd.sock
+      args:
+        creates: /etc/kubernetes/admin.conf  # only run if cluster not already initialized
+      register: k8s_init
+
+    - name: Create .kube directory in the user's home
+      file:
+        path: /home/{{ ansible_user }}/.kube
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+
+    - name: Copy admin kubeconfig to user home
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/{{ ansible_user }}/.kube/config
+        remote_src: true
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: 0644
+
+    - name: Create a fresh join token and print the kubeadm join command
+      shell: |
+        kubeadm token create --print-join-command
+      register: join_token
+
+    - name: Set final join command fact with containerd socket
+      set_fact:
+        kubeadm_join_cmd: "{{ join_token.stdout }} --cri-socket unix:///run/containerd/containerd.sock"
+
+    - name: Debug the final join command
+      debug:
+        var: kubeadm_join_cmd
+
+    ###########################################################################
+    # 4. Install Calico CNI
+    ###########################################################################
+    - name: Install Calico CNI
+      shell: |
+        kubectl apply --kubeconfig /etc/kubernetes/admin.conf \
+          -f https://raw.githubusercontent.com/projectcalico/calico/v3.25.0/manifests/calico.yaml
+      register: cni_install
+      until: cni_install is succeeded
+      retries: 5
+      delay: 10
+
+- hosts: k8s_workers
+  become: yes
+  tasks:
+    ###########################################################################
+    # 5. Join workers to the cluster using the stored token
+    ###########################################################################
+    - name: Join worker nodes to the cluster
+      shell: "{{ hostvars[groups['k8s_masters'][0]].kubeadm_join_cmd }}"
+      args:
+        creates: /etc/kubernetes/kubelet.conf
+      register: join_output
+
+    - name: Debug join output (optional)
+      debug:
+        var: join_output
