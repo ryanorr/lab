@@ -142,9 +142,9 @@
       set_fact:
         kubeadm_join_cmd: "{{ join_token.stdout }} --cri-socket unix:///run/containerd/containerd.sock"
 
-    - name: Debug the final join command
-      debug:
-        var: kubeadm_join_cmd
+        # - name: Debug the final join command
+        # debug:
+        # var: kubeadm_join_cmd
 
     ###########################################################################
     # 4. Install Calico CNI
@@ -170,6 +170,6 @@
         creates: /etc/kubernetes/kubelet.conf
       register: join_output
 
-    - name: Debug join output (optional)
-      debug:
-        var: join_output
+      # - name: Debug join output (optional)
+      # debug:
+      # var: join_output
