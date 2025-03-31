@@ -25,14 +25,15 @@
         - "6443/tcp"
         - "10250/tcp"
 
-    - name: Disable swap (remove from /etc/fstab and turn it off)
-      shell: |
-        sed -i '/swap/d' /etc/fstab
-        swapoff -a
-      args:
-        creates: /root/.swapoff-ansible
-      register: disable_swap
-      changed_when: disable_swap.rc == 0
+    - name: Remove swap entries from /etc/fstab
+      lineinfile:
+        path: /etc/fstab
+        regexp: '^\s*([^#]\S+\s+){2}swap\s+'
+        state: absent
+
+    - name: Disable swap immediately if enabled
+      command: swapoff -a
+      when: ansible_swaptotal_mb | int > 0
 
     ###########################################################################
     # 2. Install containerd & Kubernetes packages
@@ -66,6 +67,20 @@
         name:
           - containerd.io
         state: latest
+
+    - name: Generate default containerd config if not present
+      command: containerd config default > /etc/containerd/config.toml
+      args:
+        creates: /etc/containerd/config.toml
+
+    - name: Enable systemd cgroup in containerd config
+      lineinfile:
+        path: /etc/containerd/config.toml
+        regexp: '^(\s*)SystemdCgroup = false'
+        line: '\1SystemdCgroup = true'
+        backrefs: yes
+      notify:
+        - Restart containerd
 
     - name: Configure containerd (systemd cgroup driver)
       shell: |
@@ -101,7 +116,17 @@
         name: kubelet
         enabled: yes
 
-- hosts: k8s_masters
+    - name: Open ports on all nodes for NodePort services and kubelet
+      firewalld:
+        port: "{{ item }}"
+        permanent: yes
+        state: enabled
+        immediate: yes
+      loop:
+        - "10250/tcp"       # Kubelet API
+        - "30000-32767/tcp" # NodePort range
+
+- hosts: control_plane
   become: yes
   tasks:
     ###########################################################################
@@ -134,8 +159,7 @@
         mode: 0644
 
     - name: Create a fresh join token and print the kubeadm join command
-      shell: |
-        kubeadm token create --print-join-command
+      command: kubeadm token create --print-join-command
       register: join_token
 
     - name: Set final join command fact with containerd socket
@@ -158,6 +182,19 @@
       retries: 5
       delay: 10
 
+    - name: Open ports on control_plane nodes for remote access
+      firewalld:
+        port: "{{ item }}"
+        permanent: yes
+        state: enabled
+        immediate: yes
+      loop:
+        - "6443/tcp"        # Kubernetes API server
+        - "2379-2380/tcp"   # etcd communication
+        - "10251/tcp"       # kube-scheduler
+        - "10252/tcp"       # kube-controller-manager
+      when: "'control_plane' in group_names"
+
 - hosts: k8s_workers
   become: yes
   tasks:
@@ -165,7 +202,7 @@
     # 5. Join workers to the cluster using the stored token
     ###########################################################################
     - name: Join worker nodes to the cluster
-      shell: "{{ hostvars[groups['k8s_masters'][0]].kubeadm_join_cmd }}"
+      shell: "{{ hostvars[groups['control_plane'][0]].kubeadm_join_cmd }}"
       args:
         creates: /etc/kubernetes/kubelet.conf
       register: join_output
